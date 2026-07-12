@@ -1,24 +1,32 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 const (
+	ArrowLeft rune = iota + 1000 // start at 1000 so we don't overlap actual runes
+	ArrowRight
+	ArrowUp
+	ArrowDown
+	PageUp
+	PageDown
+	Home
+	End
+	Delete
+)
+
+const (
 	giloVersion = "0.0.1"
-
-	ArrowLeft  rune = 'a'
-	ArrowRight rune = 'd'
-	ArrowUp    rune = 'w'
-	ArrowDown  rune = 's'
-
-	PageUp   rune
-	PageDown rune
+	giloTabStop = 4
 )
 
 func enableRawMode() (*Termios, error) {
@@ -26,7 +34,7 @@ func enableRawMode() (*Termios, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw := *originalTermios
+	raw := originalTermios.Clone()
 	raw.Iflag &^= syscall.BRKINT | syscall.ICRNL | syscall.INPCK | syscall.ISTRIP | syscall.IXON
 	raw.Oflag &^= syscall.OPOST
 	raw.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.IEXTEN | syscall.ISIG
@@ -47,6 +55,10 @@ func (keysStatic) ctrlKey(c rune) rune {
 
 var keys = keysStatic{}
 
+type erow struct {
+	chars, render string
+}
+
 type editor struct {
 	termios *Termios
 
@@ -56,8 +68,15 @@ type editor struct {
 	buf        []byte
 	rows, cols int
 
-	// cursor x and y
-	cx, cy int
+	rowoff, coloff int
+	erow           []erow
+	filename       string
+
+	// cursor (x,y), and rx (render)
+	cx, cy, rx int
+
+	statusMsg  string
+	statusTime time.Time
 }
 
 func newEditor(termios *Termios) *editor {
@@ -67,14 +86,13 @@ func newEditor(termios *Termios) *editor {
 			termios: termios,
 			input:   os.Stdin,
 			output:  os.Stdout,
-			cx:      0,
-			cy:      0,
 		}
 	)
 	e.rows, e.cols, err = e.getWindowSize() // fixme: this isn't idiomatic
 	if err != nil {
 		panic(err)
 	}
+	e.rows -= 2 // status bar + message
 	return e
 }
 
@@ -97,6 +115,54 @@ func (e *editor) Write() error {
 	return nil
 }
 
+func (e *editor) updateRow(row *erow) {
+	row.render = strings.ReplaceAll(row.chars, "\t", strings.Repeat(" ", giloTabStop))
+}
+
+func (e *editor) Open(filename string) error {
+	e.filename = filename
+	f, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", filename, err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("scanning lines: %w", err)
+		}
+		text := scanner.Text()
+		row := erow{chars: text}
+		e.updateRow(&row)
+		e.erow = append(e.erow, row)
+	}
+	return nil
+}
+
+func (e *editor) rowInsertChar(row *erow, at int, c rune) {
+	row.chars = row.chars[:at] + string(c) + row.chars[at:]
+	e.updateRow(row)
+}
+
+func (e *editor) insertChar(c rune) {
+	if e.cy == len(e.erow) {
+		e.erow = append(e.erow, erow{})
+	}
+	e.rowInsertChar(&e.erow[e.cy], e.cx, c)
+	e.cx++
+}
+
+// readEscByte reads a single byte without retrying on timeout, so a lone
+// ESC press (no follow-up bytes) can be distinguished from an escape sequence.
+func (e *editor) readEscByte() (byte, bool) {
+	buf := make([]byte, 1)
+	n, err := e.input.Read(buf)
+	if err != nil && err != io.EOF {
+		panic(err)
+	}
+	return buf[0], n == 1
+}
+
 func (e *editor) ReadKey() rune {
 	var (
 		buf = make([]byte, 1)
@@ -110,26 +176,47 @@ func (e *editor) ReadKey() rune {
 		}
 	}
 
-	if buf[0] == '\x1b' {
-		escapeBuf := make([]byte, 2)
-		n, err = e.input.Read(escapeBuf)
-		if err != nil && err != io.EOF {
-			panic(err)
-		}
+	if buf[0] != '\x1b' {
+		return rune(buf[0])
+	}
 
-		if v, ok := map[string]rune{
-			"[5~": PageUp,
-			"[6~": PageDown,
-			"[A":  ArrowUp,
-			"[B":  ArrowDown,
-			"[C":  ArrowRight,
-			"[D":  ArrowLeft,
-		}[string(escapeBuf)]; ok {
+	seq0, ok := e.readEscByte()
+	if !ok || seq0 != '[' {
+		return rune('\x1b')
+	}
+	seq1, ok := e.readEscByte()
+	if !ok {
+		return rune('\x1b')
+	}
+
+	if seq1 >= '0' && seq1 <= '9' {
+		seq2, ok := e.readEscByte()
+		if !ok || seq2 != '~' {
+			return rune('\x1b')
+		}
+		if v, ok := map[byte]rune{
+			'1': Home,
+			'3': Delete,
+			'4': End,
+			'5': PageUp,
+			'6': PageDown,
+		}[seq1]; ok {
 			return v
 		}
 		return rune('\x1b')
 	}
-	return rune(buf[0])
+
+	if v, ok := map[byte]rune{
+		'A': ArrowUp,
+		'B': ArrowDown,
+		'C': ArrowRight,
+		'D': ArrowLeft,
+		'H': Home,
+		'F': End,
+	}[seq1]; ok {
+		return v
+	}
+	return rune('\x1b')
 }
 
 func (e *editor) getWindowSize() (int, int, error) {
@@ -148,37 +235,94 @@ func (e *editor) getWindowSize() (int, int, error) {
 	return int(ws.rows), int(ws.cols), nil
 }
 
+func (e *editor) editorRowCxtoRx(row *erow, cx int) int {
+	rx := 0
+	for j := range cx {
+		if row.chars[j] == '\t' {
+			rx += giloTabStop - 1 - rx%giloTabStop
+		}
+		rx++
+	}
+	return rx
+}
+
 func (e *editor) drawRows() {
 	for y := range e.rows {
-		if y == e.rows/3 {
-			welcome := fmt.Sprintf("gilo editor -- verison %s", giloVersion)
-			padding := (e.cols - len(welcome)) / 2
-			if padding > 0 {
+		filerow := y + e.rowoff
+		if filerow >= len(e.erow) {
+			if len(e.erow) == 0 && y == e.rows/3 {
+				welcome := fmt.Sprintf("gilo editor -- verison %s", giloVersion)
+				padding := (e.cols - len(welcome)) / 2
+				if padding > 0 {
+					e.AppendString("~")
+					padding--
+				}
+				for ; padding > 0; padding-- {
+					e.AppendString(" ")
+				}
+				e.AppendString(welcome)
+			} else {
 				e.AppendString("~")
-				padding--
 			}
-			for ; padding > 0; padding-- {
-				e.AppendString(" ")
-			}
-			e.AppendString(welcome)
 		} else {
-			e.AppendString("~")
+			row := e.erow[filerow]
+			start := min(e.coloff, len(row.render))
+			end := min(start+e.cols, len(row.render))
+			e.AppendString(row.render[start:end])
 		}
 
 		e.AppendString("\x1b[K")
-		if y < e.rows-1 {
-			e.AppendString("\r\n")
+		e.AppendString("\r\n")
+	}
+}
+
+func (e *editor) drawStatusBar() {
+	var filename = "[No Name]"
+	e.AppendString("\x1b[7m")
+	if e.filename != "" {
+		filename = e.filename
+	}
+	filestatus := fmt.Sprintf("%.20s - %d lines", filename, len(e.erow))
+	if len(filestatus) > e.cols {
+		filestatus = filestatus[:e.cols]
+	}
+	linenum := fmt.Sprintf("%d/%d", e.cy+1, len(e.erow))
+
+	e.AppendString(filestatus)
+	for l := len(filestatus); l < e.cols; l++ {
+		if e.cols-l == len(linenum) {
+			e.AppendString(linenum)
+			break
 		}
+		e.AppendString(" ")
+	}
+	e.AppendString("\x1b[m")
+	e.AppendString("\r\n")
+}
+
+func (e *editor) drawMessageBar() {
+	e.AppendString("\x1b[K")
+	end := min(len(e.statusMsg), e.cols)
+	if time.Since(e.statusTime) < 5*time.Second {
+		e.AppendString(e.statusMsg[:end])
 	}
 }
 
 func (e *editor) refreshScreen() {
+	e.Scroll()
 	e.AppendString("\x1b[?25l")
 	e.AppendString("\x1b[H")
 	e.drawRows()
-	e.AppendString(fmt.Sprintf("\x1b[%d;%dH", e.cy+1, e.cx+1))
+	e.drawStatusBar()
+	e.drawMessageBar()
+	e.AppendString(fmt.Sprintf("\x1b[%d;%dH", e.cy-e.rowoff+1, e.rx-e.coloff+1))
 	e.AppendString("\x1b[?25h")
 	e.Write()
+}
+
+func (e *editor) setStatusMessage(message string) {
+	e.statusMsg = message
+	e.statusTime = time.Now()
 }
 
 func (e *editor) processKeypress(cancel context.CancelFunc) {
@@ -191,8 +335,32 @@ func (e *editor) processKeypress(cancel context.CancelFunc) {
 		e.output.WriteString("\x1b[?25h")
 		cancel()
 
+	case Home:
+		e.cx = 0
+	case End:
+		if e.cy < len(e.erow) {
+			e.cx = len(e.erow[e.cy].chars)
+		}
+
+	case PageUp, PageDown:
+		var direction rune
+		switch c {
+		case PageUp:
+			direction = ArrowUp
+			e.cy = e.rowoff
+		case PageDown:
+			direction = ArrowDown
+			e.cy = min(e.rowoff+e.rows-1, len(e.erow))
+		}
+		for times := e.rows; times > 0; times-- {
+			e.editorMoveCursor(direction)
+		}
+
 	case ArrowUp, ArrowLeft, ArrowDown, ArrowRight:
 		e.editorMoveCursor(c)
+
+	default:
+		e.insertChar(c)
 	}
 }
 
@@ -219,23 +387,59 @@ func (e editor) getCursorPosition() (int, int, error) {
 }
 
 func (e *editor) editorMoveCursor(key rune) {
+	var row *string
+	if e.cy < len(e.erow) {
+		row = &e.erow[e.cy].chars
+	}
 	switch key {
 	case ArrowLeft:
 		if e.cx != 0 {
 			e.cx--
+		} else if e.cx > 0 {
+			e.cy--
+			e.cx = len(e.erow[e.cy].chars)
 		}
 	case ArrowRight:
-		if e.cx != e.cols-1 {
+		if row != nil && e.cx < len(*row) {
 			e.cx++
+		} else if row != nil && e.cx == len(*row) {
+			e.cy++
+			e.cx = 0
 		}
 	case ArrowUp:
 		if e.cy != 0 {
 			e.cy--
 		}
 	case ArrowDown:
-		if e.cy != e.rows-1 {
+		if e.cy < len(e.erow) {
 			e.cy++
 		}
+	}
+
+	if e.cy < len(e.erow) {
+		row = &e.erow[e.cy].chars
+	}
+	if row != nil && e.cx > len(*row) {
+		e.cx = len(*row)
+	}
+}
+
+func (e *editor) Scroll() {
+	e.rx = 0
+	if e.cy < len(e.erow) {
+		e.rx = e.editorRowCxtoRx(&e.erow[e.cy], e.cx)
+	}
+	if e.cy < e.rowoff {
+		e.rowoff = e.cy
+	}
+	if e.cy >= e.rowoff+e.rows {
+		e.rowoff = e.cy - e.rows + 1
+	}
+	if e.rx < e.coloff {
+		e.coloff = e.rx
+	}
+	if e.rx >= e.coloff+e.cols {
+		e.coloff = e.rx - e.cols + 1
 	}
 }
 
@@ -247,7 +451,18 @@ func main() {
 	}
 	defer ot.SetAttr(uintptr(syscall.Stdin))
 
+	// enter the alternate screen buffer: keeps our redraws out of the
+	// terminal's scrollback, and makes terminals forward PageUp/PageDown
+	// and fn-arrow combos to us instead of using them to scroll history.
+	os.Stdout.WriteString("\x1b[?1049h")
+	defer os.Stdout.WriteString("\x1b[?1049l")
+
 	e := newEditor(ot)
+	if len(os.Args) >= 2 {
+		e.Open(os.Args[1])
+	}
+
+	e.setStatusMessage("HELP: Ctrl-Q = quit")
 
 	for {
 		e.refreshScreen()

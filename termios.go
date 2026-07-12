@@ -17,6 +17,10 @@ type Termios struct {
 	Ospeed uint64
 }
 
+func (tio *Termios) Clone() Termios {
+	return *tio
+}
+
 func ioctl(fd, cmd uintptr, arg unsafe.Pointer) error {
 	return ioctlu(fd, cmd, uintptr(arg))
 }
