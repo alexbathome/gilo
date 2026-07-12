@@ -22,46 +22,22 @@ const (
 	Home
 	End
 	Delete
-)
 
-const (
 	giloVersion           = "0.0.1"
 	giloTabStop           = 4
 	quitTimesDefault      = 3
 	Backspace        rune = 127
 )
 
-func enableRawMode() (*Termios, error) {
-	originalTermios, err := GetAttr(uintptr(syscall.Stdin))
-	if err != nil {
-		return nil, err
-	}
-	raw := originalTermios.Clone()
-	raw.Iflag &^= syscall.BRKINT | syscall.ICRNL | syscall.INPCK | syscall.ISTRIP | syscall.IXON
-	raw.Oflag &^= syscall.OPOST
-	raw.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.IEXTEN | syscall.ISIG
-	raw.Cflag |= syscall.CS8
-	raw.Cc[syscall.VMIN] = 0
-	raw.Cc[syscall.VTIME] = 1
-	return originalTermios, raw.SetAttr(uintptr(syscall.Stdin))
-}
-
-// keysStatic holds key-related helper methods without a separate package.
-type keysStatic struct{}
-
-func (keysStatic) ctrlKey(c rune) rune {
+func ctrlKey(c rune) rune {
 	return c & 0x1f
 }
-
-var keys = keysStatic{}
 
 type erow struct {
 	chars, render string
 }
 
 type editor struct {
-	termios *Termios
-
 	input  *os.File //fixme: can these be an interface??
 	output *os.File
 
@@ -73,19 +49,16 @@ type editor struct {
 	filename       string
 	cx, cy, rx     int // cursor position; rx is the rendered x (tabs expand)
 
-	statusMsg       string
-	statusTime      time.Time
-	dirty           int
-	quitTimes       int
-	lastMatch       int
-	searchDirection rune
+	statusMsg                   string
+	statusTime                  time.Time
+	dirty, quitTimes, lastMatch int
+	searchDirection             rune
 }
 
-func newEditor(termios *Termios) *editor {
+func newEditor() *editor {
 	var (
 		err error
 		e   = &editor{
-			termios:         termios,
 			input:           os.Stdin,
 			output:          os.Stdout,
 			quitTimes:       quitTimesDefault,
@@ -101,13 +74,8 @@ func newEditor(termios *Termios) *editor {
 	return e
 }
 
-// Append is similar to the abAppend buffer in kilo.
-func (e *editor) Append(in []byte) {
-	e.buf = append(e.buf, in...)
-}
-
 func (e *editor) AppendString(in string) {
-	e.Append([]byte(in))
+	e.buf = append(e.buf, []byte(in)...)
 }
 
 func (e *editor) Write() error {
@@ -254,6 +222,20 @@ func (e *editor) readEscByte() (byte, bool) {
 	return buf[0], n == 1
 }
 
+var escSeqKeys = map[byte]rune{
+	'1': Home,
+	'3': Delete,
+	'4': End,
+	'5': PageUp,
+	'6': PageDown,
+	'A': ArrowUp,
+	'B': ArrowDown,
+	'C': ArrowRight,
+	'D': ArrowLeft,
+	'H': Home,
+	'F': End,
+}
+
 func (e *editor) ReadKey() rune {
 	var (
 		buf = make([]byte, 1)
@@ -285,26 +267,13 @@ func (e *editor) ReadKey() rune {
 		if !ok || seq2 != '~' {
 			return rune('\x1b')
 		}
-		if v, ok := map[byte]rune{
-			'1': Home,
-			'3': Delete,
-			'4': End,
-			'5': PageUp,
-			'6': PageDown,
-		}[seq1]; ok {
+		if v, ok := escSeqKeys[seq1]; ok {
 			return v
 		}
 		return rune('\x1b')
 	}
 
-	if v, ok := map[byte]rune{
-		'A': ArrowUp,
-		'B': ArrowDown,
-		'C': ArrowRight,
-		'D': ArrowLeft,
-		'H': Home,
-		'F': End,
-	}[seq1]; ok {
+	if v, ok := escSeqKeys[seq1]; ok {
 		return v
 	}
 	return rune('\x1b')
@@ -441,7 +410,7 @@ func (e *editor) prompt(promptFmt string, callback func(query string, key rune))
 		e.refreshScreen()
 		c := e.ReadKey()
 		switch {
-		case c == Delete || c == Backspace || c == keys.ctrlKey('h'):
+		case c == Delete || c == Backspace || c == ctrlKey('h'):
 			if len(buf) > 0 {
 				buf = buf[:len(buf)-1]
 			}
@@ -520,14 +489,14 @@ func (e *editor) find() {
 
 func (e *editor) processKeypress(cancel context.CancelFunc) {
 	c := e.ReadKey()
-	if c != keys.ctrlKey('q') {
+	if c != ctrlKey('q') {
 		e.quitTimes = quitTimesDefault
 	}
 
 	switch c {
 	case '\r':
 		e.insertNewline()
-	case keys.ctrlKey('q'):
+	case ctrlKey('q'):
 		if e.dirty > 0 && e.quitTimes > 0 {
 			e.setStatusMessage(fmt.Sprintf("WARNING!!! File has unsaved changes. Press Ctrl-Q %d more times to quit.", e.quitTimes))
 			e.quitTimes--
@@ -538,9 +507,9 @@ func (e *editor) processKeypress(cancel context.CancelFunc) {
 		e.output.WriteString("\x1b[H")
 		e.output.WriteString("\x1b[?25h")
 		cancel()
-	case keys.ctrlKey('s'):
+	case ctrlKey('s'):
 		e.save()
-	case keys.ctrlKey('f'):
+	case ctrlKey('f'):
 		e.find()
 	case Home:
 		e.cx = 0
@@ -548,7 +517,7 @@ func (e *editor) processKeypress(cancel context.CancelFunc) {
 		if e.cy < len(e.erow) {
 			e.cx = len(e.erow[e.cy].chars)
 		}
-	case Backspace, keys.ctrlKey('h'):
+	case Backspace, ctrlKey('h'):
 		e.delChar()
 	case Delete:
 		if e.cy < len(e.erow) {
@@ -573,7 +542,7 @@ func (e *editor) processKeypress(cancel context.CancelFunc) {
 		}
 	case ArrowUp, ArrowLeft, ArrowDown, ArrowRight:
 		e.editorMoveCursor(c)
-	case '\x1b', keys.ctrlKey('l'):
+	case '\x1b', ctrlKey('l'):
 		// no-op: the screen already refreshes every loop iteration
 	default:
 		e.insertChar(c)
@@ -660,11 +629,12 @@ func (e *editor) Scroll() {
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
-	ot, err := enableRawMode()
+	t, err := NewTermios()
 	if err != nil {
 		panic(err)
 	}
-	defer ot.SetAttr(uintptr(syscall.Stdin))
+	t.setRaw()
+	defer t.reset()
 
 	// enter the alternate screen buffer: keeps our redraws out of the
 	// terminal's scrollback, and makes terminals forward PageUp/PageDown
@@ -672,7 +642,7 @@ func main() {
 	os.Stdout.WriteString("\x1b[?1049h")
 	defer os.Stdout.WriteString("\x1b[?1049l")
 
-	e := newEditor(ot)
+	e := newEditor()
 	if len(os.Args) >= 2 {
 		e.Open(os.Args[1])
 	}
