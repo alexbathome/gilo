@@ -25,8 +25,10 @@ const (
 )
 
 const (
-	giloVersion = "0.0.1"
-	giloTabStop = 4
+	giloVersion           = "0.0.1"
+	giloTabStop           = 4
+	quitTimesDefault      = 3
+	Backspace        rune = 127
 )
 
 func enableRawMode() (*Termios, error) {
@@ -44,9 +46,7 @@ func enableRawMode() (*Termios, error) {
 	return originalTermios, raw.SetAttr(uintptr(syscall.Stdin))
 }
 
-// keysStatic just gives me a place to hold
-// key related methods(functions). without
-// breaking into another package.
+// keysStatic holds key-related helper methods without a separate package.
 type keysStatic struct{}
 
 func (keysStatic) ctrlKey(c rune) rune {
@@ -71,21 +71,26 @@ type editor struct {
 	rowoff, coloff int
 	erow           []erow
 	filename       string
+	cx, cy, rx     int // cursor position; rx is the rendered x (tabs expand)
 
-	// cursor (x,y), and rx (render)
-	cx, cy, rx int
-
-	statusMsg  string
-	statusTime time.Time
+	statusMsg       string
+	statusTime      time.Time
+	dirty           int
+	quitTimes       int
+	lastMatch       int
+	searchDirection rune
 }
 
 func newEditor(termios *Termios) *editor {
 	var (
 		err error
 		e   = &editor{
-			termios: termios,
-			input:   os.Stdin,
-			output:  os.Stdout,
+			termios:         termios,
+			input:           os.Stdin,
+			output:          os.Stdout,
+			quitTimes:       quitTimesDefault,
+			lastMatch:       -1,
+			searchDirection: ArrowRight,
 		}
 	)
 	e.rows, e.cols, err = e.getWindowSize() // fixme: this isn't idiomatic
@@ -96,12 +101,11 @@ func newEditor(termios *Termios) *editor {
 	return e
 }
 
-// similar to the abAppend in kilo
+// Append is similar to the abAppend buffer in kilo.
 func (e *editor) Append(in []byte) {
 	e.buf = append(e.buf, in...)
 }
 
-// with some convenience
 func (e *editor) AppendString(in string) {
 	e.Append([]byte(in))
 }
@@ -144,16 +148,103 @@ func (e *editor) rowInsertChar(row *erow, at int, c rune) {
 	e.updateRow(row)
 }
 
+func (e *editor) rowDelChar(row *erow, at int) {
+	if at < 0 || at >= len(row.chars) {
+		return
+	}
+	row.chars = row.chars[:at] + row.chars[at+1:]
+	e.updateRow(row)
+}
+
+func (e *editor) rowAppendString(row *erow, s string) {
+	row.chars += s
+	e.updateRow(row)
+}
+
+func (e *editor) insertRow(at int, chars string) {
+	row := erow{chars: chars}
+	e.updateRow(&row)
+	e.erow = append(e.erow, erow{})
+	copy(e.erow[at+1:], e.erow[at:])
+	e.erow[at] = row
+}
+
+func (e *editor) delRow(at int) {
+	if at < 0 || at >= len(e.erow) {
+		return
+	}
+	e.erow = append(e.erow[:at], e.erow[at+1:]...)
+}
+
 func (e *editor) insertChar(c rune) {
 	if e.cy == len(e.erow) {
-		e.erow = append(e.erow, erow{})
+		e.insertRow(len(e.erow), "")
 	}
 	e.rowInsertChar(&e.erow[e.cy], e.cx, c)
 	e.cx++
+	e.dirty++
 }
 
-// readEscByte reads a single byte without retrying on timeout, so a lone
-// ESC press (no follow-up bytes) can be distinguished from an escape sequence.
+func (e *editor) insertNewline() {
+	if e.cx == 0 {
+		e.insertRow(e.cy, "")
+	} else {
+		row := &e.erow[e.cy]
+		e.insertRow(e.cy+1, row.chars[e.cx:])
+		row = &e.erow[e.cy] // e.erow may have been reallocated by insertRow
+		row.chars = row.chars[:e.cx]
+		e.updateRow(row)
+	}
+	e.cy++
+	e.cx = 0
+	e.dirty++
+}
+
+func (e *editor) delChar() {
+	if e.cy == len(e.erow) || (e.cx == 0 && e.cy == 0) {
+		return
+	}
+	row := &e.erow[e.cy]
+	if e.cx > 0 {
+		e.rowDelChar(row, e.cx-1)
+		e.cx--
+	} else {
+		prev := &e.erow[e.cy-1]
+		e.cx = len(prev.chars)
+		e.rowAppendString(prev, row.chars)
+		e.delRow(e.cy)
+		e.cy--
+	}
+	e.dirty++
+}
+
+func (e *editor) rowsToString() string {
+	lines := make([]string, len(e.erow))
+	for i, row := range e.erow {
+		lines[i] = row.chars
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func (e *editor) save() {
+	if e.filename == "" {
+		filename, ok := e.prompt("Save as: %s (ESC to cancel)", nil)
+		if !ok {
+			e.setStatusMessage("Save aborted")
+			return
+		}
+		e.filename = filename
+	}
+	data := []byte(e.rowsToString())
+	if err := os.WriteFile(e.filename, data, 0644); err != nil {
+		e.setStatusMessage(fmt.Sprintf("Can't save! I/O error: %s", err))
+		return
+	}
+	e.dirty = 0
+	e.setStatusMessage(fmt.Sprintf("%d bytes written to disk", len(data)))
+}
+
+// readEscByte reads a single byte without retrying on timeout, so a lone ESC press can be distinguished from an escape sequence.
 func (e *editor) readEscByte() (byte, bool) {
 	buf := make([]byte, 1)
 	n, err := e.input.Read(buf)
@@ -246,6 +337,20 @@ func (e *editor) editorRowCxtoRx(row *erow, cx int) int {
 	return rx
 }
 
+func (e *editor) rowRxToCx(row *erow, rx int) int {
+	curRx, cx := 0, 0
+	for cx = range row.chars {
+		if row.chars[cx] == '\t' {
+			curRx += giloTabStop - 1 - curRx%giloTabStop
+		}
+		curRx++
+		if curRx > rx {
+			return cx
+		}
+	}
+	return len(row.chars)
+}
+
 func (e *editor) drawRows() {
 	for y := range e.rows {
 		filerow := y + e.rowoff
@@ -270,7 +375,6 @@ func (e *editor) drawRows() {
 			end := min(start+e.cols, len(row.render))
 			e.AppendString(row.render[start:end])
 		}
-
 		e.AppendString("\x1b[K")
 		e.AppendString("\r\n")
 	}
@@ -282,12 +386,15 @@ func (e *editor) drawStatusBar() {
 	if e.filename != "" {
 		filename = e.filename
 	}
-	filestatus := fmt.Sprintf("%.20s - %d lines", filename, len(e.erow))
+	modified := ""
+	if e.dirty > 0 {
+		modified = " (modified)"
+	}
+	filestatus := fmt.Sprintf("%.20s - %d lines%s", filename, len(e.erow), modified)
 	if len(filestatus) > e.cols {
 		filestatus = filestatus[:e.cols]
 	}
 	linenum := fmt.Sprintf("%d/%d", e.cy+1, len(e.erow))
-
 	e.AppendString(filestatus)
 	for l := len(filestatus); l < e.cols; l++ {
 		if e.cols-l == len(linenum) {
@@ -325,23 +432,132 @@ func (e *editor) setStatusMessage(message string) {
 	e.statusTime = time.Now()
 }
 
+// prompt reads a line of input on the status bar; callback (if non-nil) is
+// invoked after every keypress so incremental search can jump to matches as you type.
+func (e *editor) prompt(promptFmt string, callback func(query string, key rune)) (string, bool) {
+	buf := ""
+	for {
+		e.setStatusMessage(fmt.Sprintf(promptFmt, buf))
+		e.refreshScreen()
+		c := e.ReadKey()
+		switch {
+		case c == Delete || c == Backspace || c == keys.ctrlKey('h'):
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+			}
+		case c == '\x1b':
+			e.setStatusMessage("")
+			if callback != nil {
+				callback(buf, c)
+			}
+			return "", false
+		case c == '\r':
+			if len(buf) != 0 {
+				e.setStatusMessage("")
+				if callback != nil {
+					callback(buf, c)
+				}
+				return buf, true
+			}
+		case c >= 32 && c < 127:
+			buf += string(c)
+		}
+		if callback != nil {
+			callback(buf, c)
+		}
+	}
+}
+
+func (e *editor) findCallback(query string, key rune) {
+	switch key {
+	case '\r', '\x1b':
+		e.lastMatch = -1
+		e.searchDirection = ArrowRight
+		return
+	case ArrowRight, ArrowDown:
+		e.searchDirection = ArrowRight
+	case ArrowLeft, ArrowUp:
+		e.searchDirection = ArrowLeft
+	default:
+		e.lastMatch = -1
+		e.searchDirection = ArrowRight
+	}
+	if query == "" {
+		return
+	}
+	current := e.lastMatch
+	for range e.erow {
+		if e.searchDirection == ArrowRight {
+			current++
+		} else {
+			current--
+		}
+		switch {
+		case current < 0:
+			current = len(e.erow) - 1
+		case current >= len(e.erow):
+			current = 0
+		}
+		row := &e.erow[current]
+		if idx := strings.Index(row.render, query); idx != -1 {
+			e.lastMatch = current
+			e.cy = current
+			e.cx = e.rowRxToCx(row, idx)
+			e.rowoff = len(e.erow) // force Scroll() to bring the match into view
+			break
+		}
+	}
+}
+
+func (e *editor) find() {
+	savedCx, savedCy := e.cx, e.cy
+	savedColoff, savedRowoff := e.coloff, e.rowoff
+	if _, ok := e.prompt("Search: %s (Use ESC/Arrows/Enter)", e.findCallback); !ok {
+		e.cx, e.cy = savedCx, savedCy
+		e.coloff, e.rowoff = savedColoff, savedRowoff
+	}
+}
+
 func (e *editor) processKeypress(cancel context.CancelFunc) {
 	c := e.ReadKey()
+	if c != keys.ctrlKey('q') {
+		e.quitTimes = quitTimesDefault
+	}
+
 	switch c {
+	case '\r':
+		e.insertNewline()
 	case keys.ctrlKey('q'):
+		if e.dirty > 0 && e.quitTimes > 0 {
+			e.setStatusMessage(fmt.Sprintf("WARNING!!! File has unsaved changes. Press Ctrl-Q %d more times to quit.", e.quitTimes))
+			e.quitTimes--
+			return
+		}
 		// use output directly as we quit
 		e.output.WriteString("\x1b[2J")
 		e.output.WriteString("\x1b[H")
 		e.output.WriteString("\x1b[?25h")
 		cancel()
-
+	case keys.ctrlKey('s'):
+		e.save()
+	case keys.ctrlKey('f'):
+		e.find()
 	case Home:
 		e.cx = 0
 	case End:
 		if e.cy < len(e.erow) {
 			e.cx = len(e.erow[e.cy].chars)
 		}
-
+	case Backspace, keys.ctrlKey('h'):
+		e.delChar()
+	case Delete:
+		if e.cy < len(e.erow) {
+			row := e.erow[e.cy]
+			if e.cx < len(row.chars) || e.cy < len(e.erow)-1 {
+				e.editorMoveCursor(ArrowRight)
+				e.delChar()
+			}
+		}
 	case PageUp, PageDown:
 		var direction rune
 		switch c {
@@ -355,10 +571,10 @@ func (e *editor) processKeypress(cancel context.CancelFunc) {
 		for times := e.rows; times > 0; times-- {
 			e.editorMoveCursor(direction)
 		}
-
 	case ArrowUp, ArrowLeft, ArrowDown, ArrowRight:
 		e.editorMoveCursor(c)
-
+	case '\x1b', keys.ctrlKey('l'):
+		// no-op: the screen already refreshes every loop iteration
 	default:
 		e.insertChar(c)
 	}
@@ -367,7 +583,6 @@ func (e *editor) processKeypress(cancel context.CancelFunc) {
 func (e editor) getCursorPosition() (int, int, error) {
 	buf := make([]byte, 32)
 	var rows, cols int
-
 	n, err := os.Stdout.Write([]byte("\x1b[6n"))
 	if n != 4 {
 		err = fmt.Errorf("incomplete write")
@@ -461,8 +676,7 @@ func main() {
 	if len(os.Args) >= 2 {
 		e.Open(os.Args[1])
 	}
-
-	e.setStatusMessage("HELP: Ctrl-Q = quit")
+	e.setStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find")
 
 	for {
 		e.refreshScreen()
