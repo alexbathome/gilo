@@ -2,6 +2,16 @@
 
 gilo is a Go port of [Antirez's kilo](https://github.com/antirez/kilo), except it's less than 350 lines of `gofmt`'d code (counted with `wc -l main.go`) and 0 dependencies :) 
 
+```
+❯ wc -l main.go
+     347 main.go
+
+❯ cat go.mod
+module github.com/alexbathome/gilo
+
+go 1.26.1
+```
+
 # disclaimer/excuses
 
 1. gilo only provides minimal syntax highlighting for go files. 
