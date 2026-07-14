@@ -1,6 +1,6 @@
 # gilo 
 
-gilo is a Go port of [Antirez's kilo](https://github.com/antirez/kilo), except it's less than 350 lines of code (counted with `wc -l main.go`) and 0 dependencies :) 
+gilo is a Go port of [Antirez's kilo](https://github.com/antirez/kilo), except it's less than 350 lines of `gofmt`'d code (counted with `wc -l main.go`) and 0 dependencies :) 
 
 # disclaimer
 
