@@ -14,7 +14,7 @@ gilo is a Go port of [Antirez's kilo](https://github.com/antirez/kilo), except i
 go run github.com/alexbathome/gilo@latest
 ```
 
-#### Key map
+#### key map
 
 ```
 ctrl-q - quit
